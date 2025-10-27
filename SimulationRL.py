@@ -79,6 +79,169 @@ from collections import deque
 #     print('No GPU available')
 
 ###############################################################################
+############################  Wrapper Stuff      ##############################
+###############################################################################
+
+saveFrequency = 10       # The number of time steps per save 
+timeSteps = 100        # Total numnber of discrete time steps made by the simulation
+
+pickleFolderName = 'RawPickledDataBlocks/' 
+
+debug = True        # NOTE Remember to set this to False when actually running. Only works for AISDDQN offline so far.
+saveReplay = True   # Saves all the information that enters experience replay. Should be False when actually running.
+
+### Global vars
+totalReceivedDataBlock = 0 # Total number of received datablocks
+saveNum = 0 # Number of parts the saved datablocks are split into
+
+class QLInfoForPickle():
+    '''
+    Stores history information for pickling
+    '''
+    def __init__(self, QLearning, satID):
+        self.history = QLearning.history
+        self.satID = satID
+        self.epsilon = QLearning.epsilon
+
+class PickleForDebug():
+    '''
+    Stores additional info for debugging DDQN agent. Mainly used to store qValues.
+    '''
+    def __init__(self, actIndex, action, block, linkedSats, newState, qValues, sat, time):
+        self.actIndex = actIndex
+        self.action = action
+        #self.block = simRLWrapper.BlocksForPickleWrapper(block, arrived=False)
+        self.newState = newState
+        self.oldState = block.oldState
+        self.qValues = qValues
+        self.satID = sat.ID
+        self.time = time    # Simulation time when this happened
+        self.blockID = block.ID
+        self.blockQPath = block.QPath
+        self.blockSource = block.source.name
+        self.blockDest = block.destination.name
+        #self.blockCheckpoints = block.checkpoints
+        #self.blockCheckpointsSend = block.checkpointsSend
+        #self.blockCreationTime = block.creationTime
+
+        self.linkedSats = {}
+        for pos, sat in linkedSats.items():
+            if sat != None:
+                self.linkedSats[pos] = sat.ID
+            else:
+                self.linkedSats[pos] = None
+
+class replayPickle():
+    def __init__(self, sars:Tuple, stateTime, nextStateTime):
+        self.state, self.action, self.reward, self.nextState, self.terminated = sars
+        self.nextStateTime = nextStateTime
+        self.stateTime = stateTime
+
+def frequentSave(env):
+    '''
+    Saves pickled datablocks
+    '''
+
+    print("-"*50)
+    print(f'Saving data at simulation time {env.now}')
+
+    try:
+        global saveNum
+        global totalReceivedDataBlock
+
+        pickledDataSavePath = outputPath + pickleFolderName
+
+        # Saving blocks 
+        print("Saving recieved datablocks...")
+        blocks = [BlocksForPickle(block) for block in receivedDataBlocks]
+        os.makedirs(pickledDataSavePath, exist_ok=True)
+        np.save("{}blocks_GT{}_part{}".format(pickledDataSavePath, CurrentGTnumber, saveNum), np.asarray(blocks),allow_pickle=True)
+
+        print("Saving not arrived datablocks...")
+        blocks_not_arrived = []
+        for block in createdBlocks:
+            if block not in receivedDataBlocks:
+                blocks_not_arrived.append(BlocksForPickle(block, arrived=False))
+        np.save("{}not_arrived_blocks_GT{}".format(pickledDataSavePath, CurrentGTnumber, saveNum), np.asarray(blocks_not_arrived),allow_pickle=True)
+
+        totalReceivedDataBlock += len(receivedDataBlocks)
+        receivedDataBlocks.clear() # unallocate to save memory
+
+        # Saving QLearning info
+        if pathing == 'Q-Learning':
+            print("Saving QLearning info")
+            someGT = createdBlocks[0].source
+            earth = someGT.earth
+            QLInfo = []
+            for orbit in earth.LEO:
+                for sat in orbit.sats:
+                    QLInfo.append(QLInfoForPickle(sat.QLearning, sat.ID))
+                    sat.QLearning.history.clear() # unallocate to save memory
+                    sat.QLearning.epsilon.clear()
+
+            np.save("{}QLInfo_GT{}_part{}".format(pickledDataSavePath, CurrentGTnumber, saveNum), np.asarray(QLInfo),allow_pickle=True)
+            saveQTables(earth.outputPath + "/NNs/", earth)
+
+        # Saving online phase DDQN info
+        elif pathing == 'Deep Q-Learning' and onlinePhase:
+            print("Saving DDQN info in online phase")
+            someGT = createdBlocks[0].source
+            earth = someGT.earth
+            QLInfo = []
+            for orbit in earth.LEO:
+                for sat in orbit.sats:
+                    QLInfo.append(QLInfoForPickle(sat.DDQNA, sat.ID))
+                    unAllocDDQN(sat.DDQNA)
+
+            np.save("{}QLInfo_GT{}_part{}".format(pickledDataSavePath, CurrentGTnumber, saveNum), np.asarray(QLInfo),allow_pickle=True)
+            saveDeepNetworks(earth.outputPath + "/NNs/", earth)
+
+        # Saving offline phase DDQN info
+        elif pathing == 'Deep Q-Learning' and not onlinePhase:
+            print("Saving DDQN info in offline phase")
+            someGT = createdBlocks[0].source
+            earth = someGT.earth
+            QLInfo = [QLInfoForPickle(earth.DDQNA, 'Earth')]
+            unAllocDDQN(earth.DDQNA)
+
+            np.save("{}QLInfo_GT{}_part{}".format(pickledDataSavePath, CurrentGTnumber, saveNum), np.asarray(QLInfo),allow_pickle=True)
+            saveDeepNetworks(earth.outputPath, earth)
+
+            if debug:
+                print("Saving debugging info")
+                np.save(f"{pickledDataSavePath}debug_GT{CurrentGTnumber}_part{saveNum}", np.asarray(earth.DDQNA.debugInfo), allow_pickle=True)
+                earth.DDQNA.debugInfo.clear()
+
+            if saveReplay:
+                print("Saving replay...")
+                np.save(f"{pickledDataSavePath}replay_GT{CurrentGTnumber}_part{saveNum}", np.asarray(earth.DDQNA.experienceReplay.toSave), allow_pickle=True)
+                earth.DDQNA.experienceReplay.toSave.clear()
+
+        print("Done saving!")
+
+    except pickle.PicklingError:
+        print('Error saving blocks with pickle')
+    except Exception as e:
+        print(f"Error saving data: {e}")
+
+    saveNum += 1
+    print("-"*50)
+
+def unAllocDDQN(DDQNA):
+    """
+    Unallocates a DDQN agent's list of losses
+    """
+    DDQNA.history.clear()
+    DDQNA.epsilon.clear()
+    try:
+        DDQNA.policyLoss.clear()
+        DDQNA.rewardApproxLoss.clear()
+        DDQNA.nextObsLoss.clear()
+        DDQNA.totalAISLoss.clear()
+        DDQNA.decompressLoss.clear()
+    except:
+        pass
+###############################################################################
 ###############################    Constants    ###############################
 ###############################################################################
 
@@ -257,7 +420,8 @@ intraRate           = []
 
 def getBlockTransmissionStats(timeToSim, GTs, constellationType, earth):
     '''
-    General Block transmission stats
+    General Block transmission stats.
+    Changed from original to use the previously saved pickled datablocks.
     '''
     allTransmissionTimes = []
     largestTransmissionTime = (0, None)
@@ -272,39 +436,51 @@ def getBlockTransmissionStats(timeToSim, GTs, constellationType, earth):
     first       = earth.gateways[0]
     second      = earth.gateways[1]
 
-    earth.pathParam
+    # Saving one last time in case receivedDataBlocks isn't empty
+    frequentSave(earth.gateways[0].env)
 
-    for block in receivedDataBlocks:
-        time = block.getTotalTransmissionTime()
-        hops = len(block.checkPoints)
-        blocks.append(BlocksForPickle(block))
+    # Loading saved datablocks
+    global saveNum
+    pickledDataSavePath = outputPath + pickleFolderName
+    for i in range(saveNum):
+        try:
+            savePath = "{}blocks_GT{}_part{}.npy".format(pickledDataSavePath, CurrentGTnumber, i)
+            blockPortion = np.load(savePath, allow_pickle=True)
+            blocks.extend(blockPortion)
 
-        if largestTransmissionTime[0] < time:
-            largestTransmissionTime = (time, block)
+            for block in blockPortion:
+                time = block.totLatency
+                hops = len(block.checkPoints)
 
-        if mostHops[0] < hops:
-            mostHops = (hops, block)
+                if largestTransmissionTime[0] < time:
+                    largestTransmissionTime = (time, block)
 
-        allTransmissionTimes.append(time)
+                if mostHops[0] < hops:
+                    mostHops = (hops, block)
 
-        queueLat.append(block.getQueueTime()[0])
-        txLat.append(block.txLatency)
-        propLat.append(block.propLatency)
-        
-        # [creation time, total latency, arrival time, source, destination, block ID, queue time, transmission latency, prop latency]
-        allLatencies.append([block.creationTime, block.totLatency, block.creationTime+block.totLatency, block.source.name, block.destination.name, block.ID, block.getQueueTime()[0], block.txLatency, block.propLatency])
-        # pre-process the received data blocks. create the rows that will be saved in csv
-        if block.source == first and block.destination == second:
-            pathBlocks[0].append([block.totLatency, block.creationTime+block.totLatency])
-            pathBlocks[1].append(block)
-        
+                allTransmissionTimes.append(time)
+
+                queueLat.append(block.queueLatency[0])
+                txLat.append(block.txLatency)
+                propLat.append(block.propLatency)
+                
+                # [creation time, total latency, arrival time, source, destination, block ID, queue time, transmission latency, prop latency]
+                allLatencies.append([block.creationTime, block.totLatency, block.creationTime+block.totLatency, block.sourceName, block.destinationName, block.ID, block.queueLatency[0], block.txLatency, block.propLatency])
+                # pre-process the received data blocks. create the rows that will be saved in csv
+                if block.sourceName == first.name and block.destinationName == second.name:
+                    pathBlocks[0].append([block.totLatency, block.creationTime+block.totLatency])
+                    pathBlocks[1].append(block)
+        except:
+            pass
+                
+    saveNum = 0
+
     # save congestion test data
     # blockPath = f"./Results/Congestion_Test/{pathing} {float(pd.read_csv('inputRL.csv')['Test length'][0])}/"
     print('Saving congestion test data...\n')
     blockPath = outputPath + '/Congestion_Test/'     
     os.makedirs(blockPath, exist_ok=True)
     try:
-        global CurrentGTnumber
         np.save("{}blocks_{}".format(blockPath, CurrentGTnumber), np.asarray(blocks),allow_pickle=True)
     except pickle.PicklingError:
         print('Error with pickle and profiling')
@@ -315,13 +491,16 @@ def getBlockTransmissionStats(timeToSim, GTs, constellationType, earth):
     print("\n########## Results #########\n")
     print(f"The simulation took {timeToSim} seconds to run")
     print(f"A total of {len(createdBlocks)} data blocks were created")
-    print(f"A total of {len(receivedDataBlocks)} data blocks were transmitted")
-    print(f"A total of {len(createdBlocks) - len(receivedDataBlocks)} data blocks were stuck")
+    print(f"A total of {totalReceivedDataBlock} data blocks were transmitted")
+    print(f"A total of {len(createdBlocks) - totalReceivedDataBlock} data blocks were stuck")
     print(f"Average transmission time for all blocks were {avgTime}")
-    print('Total latecies:\nQueue time: {}%\nTransmission time: {}%\nPropagation time: {}%'.format(
-        '%.4f' % float(sum(queueLat)/totalTime*100),
-        '%.4f' % float(sum(txLat)/totalTime*100),
-        '%.4f' % float(sum(propLat)/totalTime*100)))
+    if totalTime != 0:
+        print('Total latencies:\nQueue time: {}%\nTransmission time: {}%\nPropagation time: {}%'.format(
+            '%.4f' % float(sum(queueLat)/totalTime*100),
+            '%.4f' % float(sum(txLat)/totalTime*100),
+            '%.4f' % float(sum(propLat)/totalTime*100)))
+    else: 
+        print("Total transmission time is 0, something is wrong. Most likely no datablocks were recieved.")
 
     results = Results(finishedBlocks=blocks,
                       constellation=constellationType,
@@ -338,17 +517,26 @@ def getBlockTransmissionStats(timeToSim, GTs, constellationType, earth):
 
 
 def simProgress(simTimelimit, env):
-    timeSteps = 100
+    """
+    Modifed to add frequent saving and timeSteps is now a global var defined at beginning of file
+    """
     timeStepSize = simTimelimit/timeSteps
     progress = 1
     startTime = time.time()
     yield env.timeout(timeStepSize)
-    while True:
-        elapsedTime = time.time() - startTime
-        estimatedTimeRemaining = elapsedTime * (timeSteps/progress) - elapsedTime
-        print("Simulation progress: {}% Estimated time remaining: {} seconds Current simulation time: {}".format(progress, int(estimatedTimeRemaining), env.now), end='\r')
-        yield env.timeout(timeStepSize)
-        progress += 1
+    try: 
+        while True:
+            elapsedTime = time.time() - startTime
+            estimatedTimeRemaining = elapsedTime * (timeSteps/progress) - elapsedTime
+            print("Simulation progress: {}% Estimated time remaining: {} seconds Current simulation time: {}".format(progress, int(estimatedTimeRemaining), env.now), end='\r')
+            yield env.timeout(timeStepSize)
+
+            if progress % saveFrequency == 0:
+                frequentSave(env) # Saving
+
+            progress += 1
+    finally:
+        frequentSave(env)
 
 
 ###############################################################################
@@ -693,7 +881,16 @@ class Results:
 
 
 class BlocksForPickle:
-    def __init__(self, block):
+    def __init__(self, block, arrived=True):
+        """
+        Modified so it calculates latency before being saved. Also now stores source and destination name strings.
+        """
+        if arrived:
+            block.getQueueTime()
+            block.getTotalTransmissionTime()
+        self.sourceName = block.source.name
+        self.destinationName = block.destination.name
+
         self.size = BLOCK_SIZE  # size in bits
         self.ID = block.ID  # a string which holds the source id, destination id, and index of the block, e.g. "1_2_12"
         self.timeAtFull = block.timeAtFull  # the simulation time at which the block was full and was ready to be sent.
@@ -1295,6 +1492,9 @@ class DataBlock:
     """
 
     def __init__(self, source, destination, ID, creationTime):
+        """
+        Added oldStateTime
+        """
         self.size = BLOCK_SIZE  # size in bits
         self.destination = destination
         self.source = source
@@ -1318,6 +1518,7 @@ class DataBlock:
         self.oldState  = None
         self.oldAction = None
         # self.oldReward = None
+        self.oldStateTime = None
 
     def getQueueTime(self):
         '''
@@ -1333,7 +1534,6 @@ class DataBlock:
             queueLatency[1].append(sendReady - arrived)
 
         self.queueLatency = queueLatency
-
         if queueLatency[0] < 0:
             print('WARNING: QUEUE LATENCY IS NEGATIVE! {}'.format(queueLatency[0]))
             print('ID: {}, Source: {}, Destination: {} Creation Time: {} First Transmission Time: {}'.format(
@@ -1347,7 +1547,6 @@ class DataBlock:
             print("checkpoints send: {}".format(self.checkPointsSend))
             print("difference between two lists: {}".format(diff))
             print('\n')
-            
         return queueLatency
 
     def getTotalTransmissionTime(self):
@@ -4076,8 +4275,13 @@ class DDQNAgent:
                 print(f"Wrong Neural Network path")
                 print('----------------------------------')
         
+        self.history = [] # The computational runtime for it to make an action (and update itself)
+        self.debugInfo = []
+        
     def getNextHop(self, newState, linkedSats, sat, block):
         '''
+        Modified to store env time in replay as well
+
         Given a new observed state and the linkied satellites, it will return the next hop
         '''
         # randomly (Exploration)
@@ -4085,7 +4289,7 @@ class DDQNAgent:
             actIndex = random.randrange(self.actionSize)
             action   = self.actions[actIndex]
             while(linkedSats[action] == None):   # if that direction has no linked satellite
-                self.experienceReplay.store(newState, actIndex, unavPenalty, newState, False) # stores experience, repeats randomly
+                self.experienceReplay.store(newState, actIndex, unavPenalty, newState, False, sat.env.now, sat.env.now) # stores experience, repeats randomly
                 self.earth.rewards.append([unavPenalty, sat.env.now])
                 action = self.actions[random.randrange(len(self.actions))]
 
@@ -4134,7 +4338,7 @@ class DDQNAgent:
             # while (linkedSats[action] is None or        # the chosen action has no linked satellite or the chosen satellite has been visited twice.
             # sum(linkedSats[action].ID == path[0] for path in block.QPath[:-1]) > 1):    
 
-                self.experienceReplay.store(newState, actIndex, unavPenalty, newState, False) # from state to the same state, reward -1, not terminated
+                self.experienceReplay.store(newState, actIndex, unavPenalty, newState, False, sat.env.now, sat.env.now) # from state to the same state, reward -1, not terminated
                 self.earth.rewards.append([unavPenalty, sat.env.now])
                 qValues[0][actIndex] = -np.inf              # it will not be chosen again (as the model has still not trained with that)
             
@@ -4147,7 +4351,7 @@ class DDQNAgent:
             #         break
                 actIndex = np.argmax(qValues)               # find again for the highest value
                 action   = self.actions[actIndex]  
-
+            self.debugInfo.append(PickleForDebug(actIndex, action, block, linkedSats, newState, qValues, sat, sat.env.now))
         destination = linkedSats[action]    # Action is the keyword of the chosen linked satellite, linkedSats is a dictionary with 
                                             # each satellite associated to its corresponding keyword
         
@@ -4159,6 +4363,8 @@ class DDQNAgent:
 
     def makeDeepAction(self, block, sat, g, earth, prevSat=None):
         '''
+        Modified to store env time in replay as well. Also stores computation costs.
+
         There is no 'Done' state, it will simply continue until the time stops.
         This function will:
         1. Observation of the environment in order to determine state space and get the linked satellites to the one making the action.
@@ -4186,6 +4392,8 @@ class DDQNAgent:
             We will store the old state of the block, the action index taken there, the reward received and the new state it moved into.
         6. Update the qTarget every n iterations.
         '''
+        startTime = time.time()
+
         # 1. Observe the state and search for the satellites linked to the one making the action
         linkedSats  = getDeepLinkedSats(sat, g, earth)
         if reducedState:
@@ -4210,16 +4418,16 @@ class DDQNAgent:
                 # distanceReward  = getDistanceRewardV4(prevSat, sat, block.destination, self.w2, self.w4)
                 queueReward     = getQueueReward   (block.queueTime[len(block.queueTime)-1], self.w1)
                 reward          = distanceReward + queueReward + ArriveReward
-                self.experienceReplay.store(block.oldState, block.oldAction, reward, newState, True)
+                self.experienceReplay.store(block.oldState, block.oldAction, reward, newState, True, block.oldStateTime, sat.env.now)
                 self.earth.rewards.append([reward, sat.env.now])
                 # self.experienceReplay.store(block.oldState, block.oldAction, ArriveReward, newState, True)
             elif distanceRew == 5:
                 distanceReward  = getDistanceRewardV5(prevSat, sat, self.w2)
                 reward          = distanceReward + ArriveReward
-                self.experienceReplay.store(block.oldState, block.oldAction, reward, newState, True)
+                self.experienceReplay.store(block.oldState, block.oldAction, reward, newState, True, block.oldStateTime, sat.env.now)
                 self.earth.rewards.append([reward, sat.env.now])
             else:
-                self.experienceReplay.store(block.oldState, block.oldAction, ArriveReward, newState, True)
+                self.experienceReplay.store(block.oldState, block.oldAction, ArriveReward, newState, True, block.oldStateTime, sat.env.now)
                 self.earth.rewards.append([ArriveReward, sat.env.now])
 
             if TrainThis: self.train(sat, earth) # FIXME why here a train?? should not be here. Make a test without this when the model is stable
@@ -4264,7 +4472,7 @@ class DDQNAgent:
             reward          = distanceReward + again + queueReward
 
         # 5. Store the experience of previous Node (Agent, satellite) if it was not a gateway  
-            self.experienceReplay.store(block.oldState, block.oldAction, reward, newState, False) # action index
+            self.experienceReplay.store(block.oldState, block.oldAction, reward, newState, False, block.oldStateTime, sat.env.now) # action index
             self.earth.rewards.append([reward, sat.env.now])
 
         # 6. Learning, train the Q-Network at every time we store experience
@@ -4282,7 +4490,9 @@ class DDQNAgent:
         # this will be saved always, except when the next hop is the destination, where the process will have already returned
         block.oldState  = newState
         block.oldAction = actIndex
-        
+        block.oldStateTime = sat.env.now
+
+        self.history.append((time.time()-startTime, sat.env.now))
         return nextHop
 
     def alignEpsilon(self, step, sat): # the epsilon is reduced with time
@@ -4383,6 +4593,8 @@ class DDQNAgent:
 class ExperienceReplay:
     def __init__(self, maxlen = 100):
         '''
+        Added new list to save replay.
+
         This is a buffer that holds information that are used during training process.
 
         Deque (Doubly Ended Queue). Deque is preferred over a list in the cases where we need quicker append and pop operations
@@ -4390,13 +4602,17 @@ class ExperienceReplay:
         to a list that provides O(n) time complexity
         '''
         self.buffer = deque(maxlen=maxlen)
+        self.toSave = []
 
-    def store(self, state, action, reward, nextState, terminated):
+    def store(self, state, action, reward, nextState, terminated, stateTime, nextStateTime):
         '''
+        Modifed to pickle SARS tuple and adds them to a list.
+
         appends a set of (state, action, reward, next state, terminated) to the experience replay buffer
         '''
         # if the buffer is full, it behave as a FIFO
         self.buffer.append((state, action, reward, nextState, terminated))
+        self.toSave.append(replayPickle(self.buffer[-1], stateTime, nextStateTime))
 
     def getBatch(self, batchSize):
         '''
@@ -4424,7 +4640,6 @@ class ExperienceReplay:
         '''
         return len(self.buffer)
         
-
 ###############################################################################
 ############################   Functions    ###################################
 ###############################################################################
@@ -4664,6 +4879,9 @@ def create_Constellation(specific_constellation, env, earth):
         min_elevation_angle = 30
 
     elif specific_constellation =="Starlink":			# Phase 1 550 km altitude orbit shell
+        """
+        NOTE This is old data, there is more satellite now.
+        """
         print("Using Starlink constellation design")
         P = 72
         N = 1584
@@ -6808,4 +7026,4 @@ if __name__ == '__main__':
     sys.stdout = Logger(outputPath + 'logfile.log')
 
     RunSimulation(GTs, './', outputPath, populationMap, radioKM=rKM)
-    # cProfile.run("RunSimulation(GTs, './', outputPath, populationMap, radioKM=rKM)")
+    #cProfile.run("RunSimulation(GTs, './', outputPath, populationMap, radioKM=rKM)", sort='tottime')
