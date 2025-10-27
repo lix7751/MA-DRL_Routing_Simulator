@@ -1085,7 +1085,8 @@ class Satellite:
                 yield sendBuffer[0][0]
 
                 # ANCHOR KPI: queueLatency at sat
-                sendBuffer[1][0].checkPointsSend.append(self.env.now)
+                if not self.env.now / movementTime == int(self.env.now / movementTime):
+                    sendBuffer[1][0].checkPointsSend.append(self.env.now)
 
                 if isSat:
                     timeToSend = sendBuffer[1][0].size / destination[2]
@@ -1332,6 +1333,21 @@ class DataBlock:
             queueLatency[1].append(sendReady - arrived)
 
         self.queueLatency = queueLatency
+
+        if queueLatency[0] < 0:
+            print('WARNING: QUEUE LATENCY IS NEGATIVE! {}'.format(queueLatency[0]))
+            print('ID: {}, Source: {}, Destination: {} Creation Time: {} First Transmission Time: {}'.format(
+                self.ID,
+                self.source.name,
+                self.destination.name,
+                self.creationTime,
+                self.timeAtFirstTransmission
+            ))
+            print("checkpoints: {}".format(self.checkPoints))
+            print("checkpoints send: {}".format(self.checkPointsSend))
+            print("difference between two lists: {}".format(diff))
+            print('\n')
+            
         return queueLatency
 
     def getTotalTransmissionTime(self):
